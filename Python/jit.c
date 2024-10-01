@@ -24,6 +24,60 @@
     #include <sys/mman.h>
 #endif
 
+#define MIN_EXPANSION    (1 * 1024 * 1024)
+#define FREE_LIST_COOKIE 0xbeefface
+
+#ifdef MS_WINDOWS
+    #define PY_PAGE_RX PAGE_EXECUTE_READ
+    #define PY_PAGE_RW PAGE_READWRITE
+#else
+    #define PY_PAGE_RX (PROT_EXEC | PROT_READ)
+    #define PY_PAGE_RW (PROT_READ | PROT_WRITE)
+#endif
+
+typedef struct _FreeList FreeList;
+
+typedef enum {
+    // Every trace has its own set of pages. Maintains W^X invariant using
+    // mprotect. Potentially large wasted padding gap at end of each trace.
+    MPROTECT_EXCLUSIVE_WX,
+
+    // Multiple traces packed together on a single page. Maintains W^X invariant
+    // using macOS MAP_JIT mmap flag.
+    MACOS_EXCLUSIVE_WX,
+
+    // Multiple traces packed together on a single page. Physical pages mapped
+    // twice in VA space as RW and RX. JIT compilation uses RW mapping,
+    // execution from RX mapping. Not W^X but hard for attacker to find pointer
+    // into RW space. Used by Android Runtime and .NET.
+    // TODO: implement (needs to return two pointers from jit_alloc)
+    MULTIMAP_RW_RX,
+
+    // Multiple traces packed together on a single page. Code left writable all
+    // the time. Good for dynamic patching. Used by Hotspot (OpenJDK), V8,
+    // SpiderMonkey, and others on non-macOS systems.
+    UNIMAP_RWX,
+} ProtectionScheme;
+
+#define DEFAULT_PROTECTION_SCHEME MPROTECT_EXCLUSIVE_WX
+
+typedef struct _FreeList {
+    uint64_t  cookie;
+    size_t    size;
+    FreeList *prev;
+    FreeList *next;
+} FreeList;
+
+typedef struct {
+    void             *memory;
+    FreeList          sentinel;
+    FreeList         *scan;
+    size_t            alignment;
+    ProtectionScheme  scheme;
+    PyMutex           mutex;
+    _PyOnceFlag       once;
+} CodeCache;
+
 static size_t
 get_page_size(void)
 {
@@ -34,6 +88,16 @@ get_page_size(void)
 #else
     return sysconf(_SC_PAGESIZE);
 #endif
+}
+
+static size_t
+get_code_alignment(ProtectionScheme scheme)
+{
+    switch (scheme) {
+    case MPROTECT_EXCLUSIVE_WX: return get_page_size();
+    default: return 64;  // Aligns to common cache line size and reduces
+                         // fragmentation slightly
+    }
 }
 
 static void
@@ -47,68 +111,298 @@ jit_error(const char *message)
     PyErr_Format(PyExc_RuntimeWarning, "JIT %s (%d)", message, hint);
 }
 
-static unsigned char *
-jit_alloc(size_t size)
-{
-    assert(size);
-    assert(size % get_page_size() == 0);
-#ifdef MS_WINDOWS
-    int flags = MEM_COMMIT | MEM_RESERVE;
-    unsigned char *memory = VirtualAlloc(NULL, size, flags, PAGE_READWRITE);
-    int failed = memory == NULL;
-#else
-    int flags = MAP_ANONYMOUS | MAP_PRIVATE;
-    unsigned char *memory = mmap(NULL, size, PROT_READ | PROT_WRITE, flags, -1, 0);
-    int failed = memory == MAP_FAILED;
-#endif
-    if (failed) {
-        jit_error("unable to allocate memory");
-        return NULL;
-    }
-    return memory;
-}
-
 static int
-jit_free(unsigned char *memory, size_t size)
+change_page_protection(unsigned char *memory, size_t size, int prot)
 {
-    assert(size);
     assert(size % get_page_size() == 0);
+
+    int failed;
 #ifdef MS_WINDOWS
-    int failed = !VirtualFree(memory, 0, MEM_RELEASE);
+    int old;
+    failed = !VirtualProtect(memory, size, prot, &old);
 #else
-    int failed = munmap(memory, size);
+    failed = mprotect(memory, size, prot);
 #endif
+
     if (failed) {
-        jit_error("unable to free memory");
+        jit_error("unable to protect executable memory");
         return -1;
     }
+
     return 0;
 }
 
 static int
-mark_executable(unsigned char *memory, size_t size)
+expand_code_cache(CodeCache *code, size_t size)
+{
+    assert(size % code->alignment == 0);
+
+#ifdef MS_WINDOWS
+    int flags = MEM_COMMIT | MEM_RESERVE;   // XXX: perhaps no commit?
+    int prot = code->scheme == UNIMAP_RWX ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE;
+    code->memory = VirtualAlloc(NULL, size, flags, prot);
+    int failed = code->memory == NULL;
+#else
+    int flags = MAP_ANONYMOUS | MAP_PRIVATE;
+    int prot = PROT_READ | PROT_WRITE;
+#ifdef __APPLE__
+    if (code->scheme == MACOS_EXCLUSIVE_WX) {
+        flags |= MAP_JIT;
+        prot |= PROT_EXEC;
+    }
+#endif
+    if (code->scheme == UNIMAP_RWX) prot |= PROT_EXEC;
+    code->memory = mmap(NULL, size, prot, flags, -1, 0);
+    int failed = code->memory == MAP_FAILED;
+#endif
+    if (failed) {
+        jit_error("unable to allocate memory");
+        return -1;
+    }
+
+#ifdef __APPLE__
+    if (code->scheme == MACOS_EXCLUSIVE_WX) {
+      // Disable write protection to initialise the free list
+      pthread_jit_write_protect_np(0);
+    }
+#endif
+
+    FreeList *fl = (FreeList *)code->memory;
+    fl->cookie = FREE_LIST_COOKIE;
+    fl->size   = size;
+    fl->prev   = &(code->sentinel);
+    fl->next   = code->sentinel.next;
+
+    fl->next->prev = fl;
+    fl->prev->next = fl;
+
+    code->scan = fl;
+    return 0;
+}
+
+static int
+code_cache_lazy_init(CodeCache *code)
+{
+    ProtectionScheme scheme = DEFAULT_PROTECTION_SCHEME;
+
+#ifdef __APPLE__
+    if (pthread_jit_write_protect_supported_np())
+        scheme = MACOS_EXCLUSIVE_WX;
+#endif
+
+    code->scheme    = scheme;
+    code->alignment = get_code_alignment(code->scheme);
+    code->scan      = &(code->sentinel);
+
+    assert((code->alignment & (code->alignment - 1)) == 0);   // Must be power of 2
+    assert(code->alignment >= sizeof(FreeList));
+
+    code->sentinel.cookie = FREE_LIST_COOKIE;
+    code->sentinel.next = code->sentinel.prev = &(code->sentinel);
+
+    return 0;
+}
+
+static size_t
+get_aligned_size(CodeCache *code, size_t size)
+{
+    return (size + code->alignment - 1) & ~(code->alignment - 1);
+}
+
+static unsigned char *
+jit_try_alloc(CodeCache *code, size_t total_size)
+{
+    assert(total_size % code->alignment == 0);
+
+    FreeList *fl = code->scan;
+    do {
+        assert(fl->cookie == FREE_LIST_COOKIE);
+        assert(fl->size > 0 || fl == &(code->sentinel));
+
+        if (fl->size >= total_size) {
+            unsigned char *p = (unsigned char *)fl;
+
+#ifdef __APPLE__
+            if (code->scheme == MACOS_EXCLUSIVE_WX) {
+                // Disable write protection for this thread until we
+                // call mark_executable (attempting to execute the
+                // MAP_JIT pages in this state results in SIGBUS)
+                pthread_jit_write_protect_np(0);
+            }
+#endif
+
+            if (fl->size == total_size) {
+                // Exact fit, unlink
+                fl->cookie = 0xbadc0ffee;
+                fl->prev->next = fl->next;
+                fl->next->prev = fl->prev;
+
+                // Start next search from following chunk
+                code->scan = fl->next;
+            }
+            else {
+                // TODO: maybe it's better to allocate from the end?
+                assert(fl->size - total_size >= sizeof(FreeList));
+                fl->cookie = 0xdeadf00d;
+
+                FreeList *tail = (FreeList *)(p + total_size);
+                tail->cookie = FREE_LIST_COOKIE;
+                tail->next   = fl->next;
+                tail->prev   = fl->prev;
+                tail->size   = fl->size - total_size;
+
+                fl->prev->next = tail;
+                fl->next->prev = tail;
+
+                // Try to take from this chunk again next time
+                code->scan = tail;
+            }
+
+            return p;
+        }
+    } while ((fl = fl->next) != code->scan);
+
+    return NULL;
+}
+
+static unsigned char *
+jit_alloc(CodeCache *code, size_t size)
+{
+    _PyOnceFlag_CallOnce(&code->once, (_Py_once_fn_t *)code_cache_lazy_init, code);
+
+    assert(size > 0);
+    size_t total_size = get_aligned_size(code, size);
+
+    PyMutex_Lock(&code->mutex);
+
+    unsigned char *p = jit_try_alloc(code, total_size);
+    if (p != NULL)
+        goto out_unlock;
+
+    // No more memory on free list so need to expand code cache
+    if (expand_code_cache(code, Py_MAX(total_size, MIN_EXPANSION)) != 0)
+        goto out_unlock;
+
+    p = jit_try_alloc(code, total_size);
+    assert(p != NULL);   // Cannot fail
+
+ out_unlock:
+    PyMutex_Unlock(&code->mutex);
+    return p;
+}
+
+static int
+jit_free(CodeCache *code, unsigned char *memory, size_t size)
+{
+    size_t total_size = get_aligned_size(code, size);
+    int result = -1;
+
+    PyMutex_Lock(&code->mutex);
+
+    // These pages are executable at the moment
+    if (code->scheme == MPROTECT_EXCLUSIVE_WX) {
+        if (change_page_protection(memory, total_size, PY_PAGE_RW))
+            goto out_unlock;
+    }
+#ifdef __APPLE__
+    else if (code->scheme == MACOS_EXCLUSIVE_WX) {
+        pthread_jit_write_protect_np(0);
+    }
+#endif
+
+    bool coalesced = false;
+    FreeList *it = code->scan;
+    do {
+        if (memory + total_size == (unsigned char *)it) {
+            // Coalesce with the free chunk after this one
+            FreeList *fl = (FreeList *)memory;
+            fl->cookie = FREE_LIST_COOKIE;
+            fl->size   = total_size + it->size;
+            fl->prev   = it->prev;
+            fl->next   = it->next;
+
+            it->cookie = 0x5add00d;
+            it->prev->next = fl;
+            it->next->prev = fl;
+
+            // We may have invalidated the original scan pointer
+            code->scan = &(code->sentinel);
+
+            coalesced = true;
+            break;
+        }
+        else if ((unsigned char *)it + it->size == memory) {
+            // Coalesce with free chunk before
+            it->size += total_size;
+            coalesced = true;
+            break;
+        }
+    } while ((it = it->next) != code->scan);
+
+    if (!coalesced) {
+        // Cannot coalesce with any existing chunks
+        FreeList *fl = (FreeList *)memory;
+        fl->cookie = FREE_LIST_COOKIE;
+        fl->size   = total_size;
+        fl->prev   = &(code->sentinel);
+        fl->next   = code->sentinel.next;
+
+        fl->prev->next = fl;
+        fl->next->prev = fl;
+    }
+
+#ifdef __APPLE__
+    if (code->scheme == MACOS_EXCLUSIVE_WX)
+        pthread_jit_write_protect_np(1);
+#endif
+
+    result = 0;
+
+ out_unlock:
+    PyMutex_Unlock(&code->mutex);
+    return result;
+}
+
+static int
+mark_executable(CodeCache *code, unsigned char *memory, size_t size)
 {
     if (size == 0) {
         return 0;
     }
-    assert(size % get_page_size() == 0);
-    // Do NOT ever leave the memory writable! Also, don't forget to flush the
-    // i-cache (I cannot begin to tell you how horrible that is to debug):
+
 #ifdef MS_WINDOWS
     if (!FlushInstructionCache(GetCurrentProcess(), memory, size)) {
         jit_error("unable to flush instruction cache");
         return -1;
     }
-    int old;
-    int failed = !VirtualProtect(memory, size, PAGE_EXECUTE_READ, &old);
 #else
     __builtin___clear_cache((char *)memory, (char *)memory + size);
-    int failed = mprotect(memory, size, PROT_EXEC | PROT_READ);
 #endif
+
+    size_t total_size = get_aligned_size(code, size);
+
+    int failed = 0;
+    switch (code->scheme) {
+    case MPROTECT_EXCLUSIVE_WX:
+        failed = change_page_protection(memory, total_size, PY_PAGE_RX);
+        break;
+
+#ifdef __APPLE__
+    case MACOS_EXCLUSIVE_WX:
+        // Deny write and allow execution
+        pthread_jit_write_protect_np(1);
+        break;
+#endif
+
+    default:
+        break;   // Nothing to do
+    }
+
     if (failed) {
         jit_error("unable to protect executable memory");
         return -1;
     }
+
     return 0;
 }
 
@@ -460,6 +754,7 @@ combine_symbol_mask(const symbol_mask src, symbol_mask dest)
         dest[i] |= src[i];
     }
 }
+static CodeCache codecache;
 
 // Compiles executor in-place. Don't forget to call _PyJIT_Free later!
 int
@@ -489,12 +784,8 @@ _PyJIT_Compile(_PyExecutorObject *executor, const _PyUOpInstruction trace[], siz
     for (size_t i = 0; i < Py_ARRAY_LENGTH(state.trampolines.mask); i++) {
         state.trampolines.size += _Py_popcount32(state.trampolines.mask[i]) * TRAMPOLINE_SIZE;
     }
-    // Round up to the nearest page:
-    size_t page_size = get_page_size();
-    assert((page_size & (page_size - 1)) == 0);
-    size_t padding = page_size - ((code_size + data_size + state.trampolines.size) & (page_size - 1));
-    size_t total_size = code_size + data_size + state.trampolines.size + padding;
-    unsigned char *memory = jit_alloc(total_size);
+    size_t total_size = code_size + data_size + state.trampolines.size;
+    unsigned char *memory = jit_alloc(&codecache, total_size);
     if (memory == NULL) {
         return -1;
     }
@@ -530,8 +821,8 @@ _PyJIT_Compile(_PyExecutorObject *executor, const _PyUOpInstruction trace[], siz
     data += group->data_size;
     assert(code == memory + code_size);
     assert(data == memory + code_size + data_size);
-    if (mark_executable(memory, total_size)) {
-        jit_free(memory, total_size);
+    if (mark_executable(&codecache, memory, total_size)) {
+        jit_free(&codecache, memory, total_size);
         return -1;
     }
     executor->jit_code = memory;
@@ -549,7 +840,7 @@ _PyJIT_Free(_PyExecutorObject *executor)
         executor->jit_code = NULL;
         executor->jit_side_entry = NULL;
         executor->jit_size = 0;
-        if (jit_free(memory, size)) {
+        if (jit_free(&codecache, memory, size)) {
             PyErr_WriteUnraisable(NULL);
         }
     }
