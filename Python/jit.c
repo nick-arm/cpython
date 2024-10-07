@@ -59,7 +59,7 @@ typedef enum {
     UNIMAP_RWX,
 } ProtectionScheme;
 
-#define DEFAULT_PROTECTION_SCHEME MPROTECT_EXCLUSIVE_WX
+#define DEFAULT_PROTECTION_SCHEME UNIMAP_RWX
 
 typedef struct _FreeList {
     uint64_t  cookie;
